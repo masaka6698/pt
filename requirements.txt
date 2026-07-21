@@ -1,1 +1,2 @@
-覆蓋上傳全部檔案，並保留 GitHub Secret：DISCORD_WEBHOOK_URL。\n
+beautifulsoup4==4.13.4
+requests==2.32.4
