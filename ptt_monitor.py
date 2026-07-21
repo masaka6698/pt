@@ -46,49 +46,105 @@ class Post:
 
 
 def fetch_posts() -> list[Post]:
-    """Fetch and parse the latest board index."""
-    response = requests.get(
-        BOARD_URL,
-        headers=HEADERS,
-        cookies={"over18": "1"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+    """Fetch and parse the latest board index with retries."""
+    session = requests.Session()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    posts: list[Post] = []
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/138.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Referer": "https://www.ptt.cc/",
+        "Connection": "close",
+    })
 
-    for entry in soup.select("div.r-ent"):
-        title_node = entry.select_one("div.title a")
-        if title_node is None:
-            # Deleted posts have no link and cannot be opened.
-            continue
+    session.cookies.set("over18", "1", domain=".ptt.cc")
 
-        href = title_node.get("href", "").strip()
-        match = re.search(r"/bbs/[^/]+/(M\.[^.]+\.[A-Z0-9]+)\.html", href)
-        if not match:
-            logging.warning("Cannot parse post ID from href: %s", href)
-            continue
+    last_error = None
 
-        author_node = entry.select_one("div.author")
-        date_node = entry.select_one("div.date")
-        push_node = entry.select_one("div.nrec")
+    for attempt in range(1, 6):
+        try:
+            logging.info("Fetching PTT, attempt %d/5", attempt)
 
-        posts.append(
-            Post(
-                post_id=match.group(1),
-                title=title_node.get_text(" ", strip=True),
-                author=author_node.get_text(" ", strip=True) if author_node else "",
-                date=date_node.get_text(" ", strip=True) if date_node else "",
-                push=push_node.get_text(" ", strip=True) if push_node else "",
-                url=urljoin(BOARD_URL, href),
+            response = session.get(
+                BOARD_URL,
+                timeout=(15, 30),
             )
-        )
+            response.raise_for_status()
 
-    if not posts:
-        raise RuntimeError("No posts parsed; PTT page structure may have changed.")
+            soup = BeautifulSoup(response.text, "html.parser")
+            posts: list[Post] = []
 
-    return posts
+            for entry in soup.select("div.r-ent"):
+                title_node = entry.select_one("div.title a")
+                if title_node is None:
+                    continue
+
+                href = title_node.get("href", "").strip()
+
+                match = re.search(
+                    r"/bbs/[^/]+/(M\.[^.]+\.[A-Z0-9]+)\.html",
+                    href,
+                )
+
+                if not match:
+                    logging.warning(
+                        "Cannot parse post ID from href: %s",
+                        href,
+                    )
+                    continue
+
+                author_node = entry.select_one("div.author")
+                date_node = entry.select_one("div.date")
+                push_node = entry.select_one("div.nrec")
+
+                posts.append(
+                    Post(
+                        post_id=match.group(1),
+                        title=title_node.get_text(" ", strip=True),
+                        author=(
+                            author_node.get_text(" ", strip=True)
+                            if author_node else ""
+                        ),
+                        date=(
+                            date_node.get_text(" ", strip=True)
+                            if date_node else ""
+                        ),
+                        push=(
+                            push_node.get_text(" ", strip=True)
+                            if push_node else ""
+                        ),
+                        url=urljoin(BOARD_URL, href),
+                    )
+                )
+
+            if not posts:
+                raise RuntimeError(
+                    "No posts parsed; PTT page structure may have changed."
+                )
+
+            return posts
+
+        except requests.RequestException as exc:
+            last_error = exc
+            logging.warning(
+                "PTT connection failed on attempt %d: %s",
+                attempt,
+                exc,
+            )
+
+            if attempt < 5:
+                time.sleep(attempt * 10)
+
+    raise RuntimeError(
+        f"PTT could not be reached after 5 attempts: {last_error}"
+    )
 
 
 def load_state() -> dict[str, Any]:
