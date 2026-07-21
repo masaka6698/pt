@@ -1,104 +1,200 @@
-# PTT PttEarnMoney → Discord 通知
+#!/usr/bin/env python3
+from __future__ import annotations
 
-每 5 分鐘由 GitHub Actions 檢查：
+import json
+import logging
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin
 
-- https://www.ptt.cc/bbs/PttEarnMoney/index.html
-- 發現新的文章 ID 時，透過 Discord Incoming Webhook 發送通知。
-- 第一次執行只記錄目前文章，不通知既有舊文。
-- `data/seen_posts.json` 由 GitHub Actions 自動提交，避免下一次重複通知。
+import requests
+from bs4 import BeautifulSoup
 
-## 1. 建立 Discord Webhook
+BOARD_URL = "https://www.ptt.cc/bbs/PttEarnMoney/index.html"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+STATE_FILE = Path("data/seen_posts.json")
+NOTIFY_ON_FIRST_RUN = os.getenv("NOTIFY_ON_FIRST_RUN", "false").lower() == "true"
+REQUEST_TIMEOUT = 30
+MAX_SEEN_POSTS = 1000
 
-1. 到 Discord 伺服器中選擇接收通知的文字頻道。
-2. 開啟「編輯頻道」→「整合」→「Webhook」。
-3. 建立 Webhook，複製 Webhook URL。
-4. Webhook URL 等同密碼，不要放進 Python 程式或公開 Repository。
 
-## 2. 建立 GitHub Repository
+@dataclass(frozen=True)
+class Post:
+    post_id: str
+    title: str
+    author: str
+    date: str
+    push: str
+    url: str
 
-建立一個新的 GitHub Repository，建議設為 **Private**。
 
-把本專案的所有檔案上傳，資料夾結構需保持如下：
+def fetch_posts() -> list[Post]:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/138.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Referer": "https://www.ptt.cc/",
+        "Connection": "close",
+    })
+    session.cookies.set("over18", "1", domain=".ptt.cc")
 
-```text
-.
-├── .github/
-│   └── workflows/
-│       └── monitor.yml
-├── data/
-│   └── seen_posts.json
-├── .gitignore
-├── ptt_monitor.py
-├── requirements.txt
-└── README.md
-```
+    last_error = None
 
-## 3. 新增 GitHub Secret
+    for attempt in range(1, 6):
+        try:
+            logging.info("Fetching PTT, attempt %d/5", attempt)
+            response = session.get(BOARD_URL, timeout=(15, REQUEST_TIMEOUT))
+            response.raise_for_status()
 
-Repository 頁面：
+            soup = BeautifulSoup(response.text, "html.parser")
+            posts: list[Post] = []
 
-1. `Settings`
-2. `Secrets and variables`
-3. `Actions`
-4. `New repository secret`
-5. Name 填：`DISCORD_WEBHOOK_URL`
-6. Secret 貼上 Discord Webhook URL
+            for entry in soup.select("div.r-ent"):
+                title_node = entry.select_one("div.title a")
+                if title_node is None:
+                    continue
 
-## 4. 允許 GitHub Actions 寫回狀態檔
+                href = title_node.get("href", "").strip()
+                match = re.search(r"/bbs/[^/]+/(M\.[^/]+)\.html$", href)
+                if not match:
+                    logging.warning("Cannot parse post ID from href: %s", href)
+                    continue
 
-Repository 頁面：
+                author_node = entry.select_one("div.author")
+                date_node = entry.select_one("div.date")
+                push_node = entry.select_one("div.nrec")
 
-1. `Settings`
-2. `Actions`
-3. `General`
-4. 找到 `Workflow permissions`
-5. 選 `Read and write permissions`
-6. 儲存
+                posts.append(Post(
+                    post_id=match.group(1),
+                    title=title_node.get_text(" ", strip=True),
+                    author=author_node.get_text(" ", strip=True) if author_node else "",
+                    date=date_node.get_text(" ", strip=True) if date_node else "",
+                    push=push_node.get_text(" ", strip=True) if push_node else "",
+                    url=urljoin(BOARD_URL, href),
+                ))
 
-工作流程本身也已設定：
+            if not posts:
+                raise RuntimeError("No posts parsed; PTT page structure may have changed.")
 
-```yaml
-permissions:
-  contents: write
-```
+            return posts
 
-## 5. 手動測試第一次執行
+        except (requests.RequestException, RuntimeError) as exc:
+            last_error = exc
+            logging.warning("PTT fetch failed on attempt %d: %s", attempt, exc)
+            if attempt < 5:
+                time.sleep(attempt * 10)
 
-1. 進入 Repository 的 `Actions`
-2. 點選 `Monitor PTT PttEarnMoney`
-3. 點 `Run workflow`
+    raise RuntimeError(f"PTT could not be fetched after 5 attempts: {last_error}")
 
-第一次成功時，Discord 預設不會收到舊文章通知；GitHub 會更新
-`data/seen_posts.json`。之後只要額板出現新文章就會通知。
 
-## 6. 想測試 Discord 通知
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {"initialized": False, "seen_ids": []}
 
-暫時把 `.github/workflows/monitor.yml` 的：
+    data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return {
+        "initialized": bool(data.get("initialized", False)),
+        "seen_ids": [str(x) for x in data.get("seen_ids", [])],
+    }
 
-```yaml
-NOTIFY_ON_FIRST_RUN: "false"
-```
 
-改成：
+def save_state(post_ids: list[str]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "initialized": True,
+        "seen_ids": list(dict.fromkeys(post_ids))[-MAX_SEEN_POSTS:],
+    }
+    STATE_FILE.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
-```yaml
-NOTIFY_ON_FIRST_RUN: "true"
-```
 
-並把 `data/seen_posts.json` 改回：
+def send_discord(post: Post) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        raise RuntimeError("Missing DISCORD_WEBHOOK_URL environment variable.")
 
-```json
-{
-  "initialized": false,
-  "seen_ids": []
-}
-```
+    payload = {
+        "username": "PTT 額板通知",
+        "allowed_mentions": {"parse": []},
+        "embeds": [{
+            "title": post.title[:256],
+            "url": post.url,
+            "description": (
+                f"作者：`{post.author}`　｜　"
+                f"日期：`{post.date}`　｜　"
+                f"推文：`{post.push or '0'}`"
+            ),
+            "footer": {"text": "PttEarnMoney 新文章"},
+        }],
+    }
 
-再手動執行一次。測試完請改回 `false`，否則第一次會把目前頁面的文章全部通知。
+    separator = "&" if "?" in DISCORD_WEBHOOK_URL else "?"
+    response = requests.post(
+        f"{DISCORD_WEBHOOK_URL}{separator}wait=true",
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
 
-## 注意事項
+    if response.status_code == 429:
+        retry_after = float(response.json().get("retry_after", 1))
+        time.sleep(retry_after)
+        response = requests.post(
+            f"{DISCORD_WEBHOOK_URL}{separator}wait=true",
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
 
-- GitHub Actions 排程的最短間隔是 5 分鐘，而且繁忙時可能延遲，不是即時推播。
-- 本程式只監看最新列表頁。若在兩次檢查間出現大量文章，多到文章已離開最新頁面，可能漏掉；一般看板流量通常不至於在 5 分鐘內發生。
-- 若 PTT 修改 HTML 結構，程式會因抓不到文章而失敗，避免錯誤覆寫狀態。
-- GitHub 可能停用長期無活動 Repository 的排程工作流程；可定期確認 Actions 是否仍啟用。
+    response.raise_for_status()
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    posts = fetch_posts()
+    state = load_state()
+    seen_ids = set(state["seen_ids"])
+    current_ids = [post.post_id for post in posts]
+
+    if not state["initialized"] and not NOTIFY_ON_FIRST_RUN:
+        save_state(current_ids)
+        logging.info(
+            "First run: stored %d current posts without notifications.",
+            len(current_ids),
+        )
+        return 0
+
+    new_posts = [post for post in posts if post.post_id not in seen_ids]
+    logging.info("Found %d new post(s).", len(new_posts))
+
+    notified_ids = []
+    for post in new_posts:
+        send_discord(post)
+        notified_ids.append(post.post_id)
+
+    save_state(state["seen_ids"] + notified_ids)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        logging.exception("Monitor failed.")
+        sys.exit(1)
